@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>THE MONOLITH | WebGPU Driven Navigation</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        display: ['Clash Display', 'sans-serif'],
+                        body: ['DM Sans', 'sans-serif'],
+                        mono: ['Space Grotesk', 'monospace'],
+                    },
+                    colors: {
+                        'brand-bg': '#020202',
+                    }
+                }
+            }
+        }
+    </script>
+    <link href="https://api.fontshare.com/v2/css?f[]=clash-display@200,400,600,700&display=swap" rel="stylesheet">
+    <link
+        href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500&family=Space+Grotesk:wght@300;500;700&display=swap"
+        rel="stylesheet">
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #020202;
+            color: #ffffff;
+            font-family: 'DM Sans', sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        #webgpu-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 1;
+            pointer-events: none;
+            /* Let clicks pass through if needed, though we track mouse globally */
+        }
+
+        #ui-layer {
+            position: relative;
+            z-index: 10;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            pointer-events: none;
+            /* Let background be unclickable where there is no UI */
+        }
+
+        .pointer-events-auto {
+            pointer-events: auto;
+        }
+
+        .nav-item {
+            position: relative;
+            cursor: pointer;
+            transition: color 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+            color: rgba(255, 255, 255, 0.3);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        .nav-item::before {
+            content: '';
+            position: absolute;
+            left: -20px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 0px;
+            height: 1px;
+            background-color: #fff;
+            transition: all 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+            opacity: 0;
+        }
+
+        .nav-item:hover,
+        .nav-item.active {
+            color: rgba(255, 255, 255, 1);
+        }
+
+        .nav-item:hover::before,
+        .nav-item.active::before {
+            width: 12px;
+            opacity: 1;
+        }
+
+        .hero-title {
+            font-size: clamp(3rem, 8vw, 8rem);
+            line-height: 0.9;
+            clip-path: polygon(0 0, 100% 0, 100% 100%, 0% 100%);
+        }
+
+        .hero-title span {
+            display: block;
+            transform: translateY(100%);
+            animation: textReveal 1.2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+
+        .hero-title span:nth-child(2) {
+            animation-delay: 0.15s;
+        }
+
+        @keyframes textReveal {
+            to {
+                transform: translateY(0);
+            }
+        }
+
+        .glass-panel {
+            background: rgba(10, 10, 10, 0.4);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border-left: 1px solid rgba(255, 255, 255, 0.05);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        /* Subtle scanline overlay for atmospheric cinematic feel */
+        .scanlines {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            background: linear-gradient(to bottom, rgba(255, 255, 255, 0), rgba(255, 255, 255, 0) 50%, rgba(0, 0, 0, 0.1) 50%, rgba(0, 0, 0, 0.1));
+            background-size: 100% 4px;
+            z-index: 5;
+            pointer-events: none;
+            opacity: 0.3;
+        }
+
+        #content-viewer {
+            transition: opacity 0.5s ease, transform 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+            opacity: 0;
+            transform: translateX(40px);
+        }
+
+        #content-viewer.visible {
+            opacity: 1;
+            transform: translateX(0);
+        }
+    </style>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+            "three/webgpu": "https://unpkg.com/three@0.170.0/build/three.webgpu.js",
+            "three/tsl": "https://unpkg.com/three@0.170.0/build/three.tsl.js"
+        }
+    }
+    </script>
+</head>
+
+<body class="bg-brand-bg relative selection:bg-white selection:text-black">
+    <div class="scanlines"></div>
+
+    <!-- Three.js Canvas Container -->
+    <div id="webgpu-canvas"></div>
+
+    <!-- UI Overlay Layer -->
+    <div id="ui-layer" class="w-full h-full flex flex-col justify-between p-8 md:p-12 lg:p-16">
+
+        <!-- Header -->
+        <header class="flex justify-between items-start w-full">
+            <div class="font-display font-semibold tracking-widest text-lg pointer-events-auto">
+                ATLS // 00X
+            </div>
+            <div class="font-mono text-xs tracking-widest opacity-40 text-right flex flex-col gap-1">
+                <span>WEBGPU 引擎运行中</span>
+                <span id="fps-counter">60.0 FPS</span>
+                <span>空间坐标: <span id="mouse-coord">0.00, 0.00</span></span>
+            </div>
+        </header>
+
+        <!-- Main Content Area -->
+        <main class="w-full flex-1 flex flex-col lg:flex-row items-center lg:items-end justify-between pb-10 gap-16">
+
+            <!-- Left Side: Hero Text & Nav -->
+            <div class="flex-1 w-full pointer-events-auto space-y-12">
+                <h1 class="font-display font-semibold hero-title text-white tracking-tight mix-blend-difference">
+                    <span>数字</span>
+                    <span class="text-transparent bg-clip-text bg-gradient-to-r from-gray-100 to-gray-600">边疆</span>
+                </h1>
+
+                <nav class="flex flex-col gap-4 font-mono text-sm w-max" id="navigation-menu">
+                    <!-- Nav items with data-target for 3D camera states & color targets -->
+                    <a href="https://pornavp.onrender.com" target="_blank"
+                        class="nav-item active flex items-center gap-4" data-index="0" data-color="#ffffff"
+                        data-cam-y="0" data-cam-z="25" data-cam-x="0" data-speed="1.0">
+                        <span class="opacity-30 text-xs">01</span>
+                        <span>WebNav Hub</span>
+                    </a>
+                    <a href="https://www.google.com/" target="_blank" class="nav-item flex items-center gap-4"
+                        data-index="1" data-color="#ff3366" data-cam-y="10" data-cam-z="15" data-cam-x="-15"
+                        data-speed="2.5">
+                        <span class="opacity-30 text-xs">02</span>
+                        <span>Google 核心搜索</span>
+                    </a>
+                    <a href="https://chatgpt.com/" target="_blank" class="nav-item flex items-center gap-4"
+                        data-index="2" data-color="#00f0ff" data-cam-y="-12" data-cam-z="18" data-cam-x="10"
+                        data-speed="0.2">
+                        <span class="opacity-30 text-xs">03</span>
+                        <span>ChatGPT</span>
+                    </a>
+                    <a href="https://gemini.google.com/" target="_blank" class="nav-item flex items-center gap-4"
+                        data-index="3" data-color="#cc00ff" data-cam-y="5" data-cam-z="5" data-cam-x="15"
+                        data-speed="4.0">
+                        <span class="opacity-30 text-xs">04</span>
+                        <span>Google Gemini</span>
+                    </a>
+                    <a href="https://grok.com/" target="_blank" class="nav-item flex items-center gap-4" data-index="4"
+                        data-color="#ffee00" data-cam-y="-5" data-cam-z="30" data-cam-x="-20" data-speed="1.5">
+                        <span class="opacity-30 text-xs">05</span>
+                        <span>Grok 神经网络</span>
+                    </a>
+                </nav>
+            </div>
+
+            <!-- Right Side: Dynamic Content Viewer -->
+            <div class="w-full lg:w-1/3 pointer-events-auto glass-panel p-8 rounded-2xl" id="content-viewer">
+                <div class="flex items-center gap-3 mb-6 font-mono text-xs tracking-widest opacity-50 uppercase">
+                    <span class="w-2 h-2 rounded-full bg-current animate-pulse" id="content-dot"></span>
+                    <span id="content-label">状态：系统已就绪</span>
+                </div>
+                <h3 class="font-display text-3xl font-medium mb-4" id="content-heading">WebNav Hub 核心枢纽</h3>
+                <p class="font-body font-light opacity-60 text-sm leading-relaxed mb-8" id="content-desc">
+                    全连接式导航母舰。所有数字边界的起点，汇聚了前沿技术入口的量子网关。
+                </p>
+                <a href="https://pornavp.onrender.com" target="_blank" id="content-action"
+                    class="font-mono text-xs uppercase tracking-widest border border-white/20 py-3 px-6 rounded-full hover:bg-white hover:text-black transition-colors duration-300 w-max inline-block">
+                    建立神经网络连接
+                </a>
+            </div>
+
+        </main>
+    </div>
+
+    <!-- UI Interaction Script -->
+    <script>
+        const contentData = [
+            { label: "状态：核心枢纽", heading: "WebNav Hub", desc: "全连接式导航母舰。所有数字边界的起点，汇聚了前沿技术入口的量子网关。", url: "https://pornavp.onrender.com" },
+            { label: "状态：全局索引", heading: "全知搜索网络", desc: "获取 Google 核心数据库访问权限。巨石矩阵将数十 PB 已索引的人类文明数据架构化为可导航的光谱路径。", url: "https://www.google.com/" },
+            { label: "状态：语言模型_1", heading: "OpenAI ChatGPT", desc: "与主序列生成式 Transformer 进行交互。随着上下文 Tokens 被实时咀嚼处理，内部晶体结构将产生高能脉冲波动。", url: "https://chatgpt.com/" },
+            { label: "状态：语言模型_2", heading: "Gemini 算力引擎", desc: "Google 的深层多模态智能矩阵。当引擎进行极高复杂度的多维推理任务时，高速张量通道将被强制点亮。", url: "https://gemini.google.com/" },
+            { label: "状态：混沌突触", heading: "Grok 知识库", desc: "开展高频、实时的数据合成提纯。巨石星系大幅扩展其混沌吸引子的作用域，最大化摄入粗糙的全宇宙数据并进行解构整合。", url: "https://grok.com/" }
+        ];
+
+        const navItems = document.querySelectorAll('.nav-item');
+        const contentViewer = document.getElementById('content-viewer');
+        const cLabel = document.getElementById('content-label');
+        const cHeading = document.getElementById('content-heading');
+        const cDesc = document.getElementById('content-desc');
+        const cDot = document.getElementById('content-dot');
+
+        // Initial reveal
+        setTimeout(() => contentViewer.classList.add('visible'), 500);
+
+        // State object to communicate with Three.js scene
+        window.APP_STATE = {
+            targetCamPos: { x: 0, y: 0, z: 25 },
+            targetColor: '#ffffff',
+            targetSpeed: 1.0,
+            mouseTarget: { x: 0, y: 0 },
+            activeIndex: 0
+        };
+
+        navItems.forEach((item, index) => {
+            item.addEventListener('mouseenter', () => {
+                // Update UI visually
+                navItems.forEach(n => n.classList.remove('active'));
+                item.classList.add('active');
+
+                // Animate content change
+                contentViewer.classList.remove('visible');
+                setTimeout(() => {
+                    const data = contentData[index];
+                    cLabel.textContent = data.label;
+                    cHeading.textContent = data.heading;
+                    cDesc.textContent = data.desc;
+                    cDot.style.backgroundColor = item.dataset.color;
+                    const actionBtn = document.getElementById('content-action');
+                    if (actionBtn) actionBtn.href = data.url;
+                    contentViewer.classList.add('visible');
+                }, 300);
+
+                // Update App State for 3D Scene to pick up
+                window.APP_STATE.activeIndex = index;
+                window.APP_STATE.targetCamPos = {
+                    x: parseFloat(item.dataset.camX),
+                    y: parseFloat(item.dataset.camY),
+                    z: parseFloat(item.dataset.camZ)
+                };
+                window.APP_STATE.targetColor = item.dataset.color;
+                window.APP_STATE.targetSpeed = parseFloat(item.dataset.speed);
+            });
+        });
+
+        // Track global mouse for parallax
+        const coordDisplay = document.getElementById('mouse-coord');
+        document.addEventListener('mousemove', (e) => {
+            const nx = (e.clientX / window.innerWidth) * 2 - 1;
+            const ny = -(e.clientY / window.innerHeight) * 2 + 1;
+            window.APP_STATE.mouseTarget.x = nx;
+            window.APP_STATE.mouseTarget.y = ny;
+            coordDisplay.textContent = `${nx.toFixed(2)}, ${ny.toFixed(2)}`;
+        });
+    </script>
+
+    <!-- CORE WEBGPU + TSL 3D SCENE -->
+    <script type="module">
+        import * as THREE from 'three';
+        import { WebGPURenderer, MeshStandardNodeMaterial } from 'three/webgpu';
+        import {
+            color, time, positionLocal, vec3, vec4, float, sin, cos,
+            instanceIndex, uniform, normalLocal, positionWorld, mix, varyingProperty
+        } from 'three/tsl';
+
+        let camera, scene, renderer;
+        let instancedMesh;
+        const INSTANCE_COUNT = 8000;
+
+        // Dynamic Uniforms driven by JavaScript
+        const uColor = uniform(color('#ffffff'));
+        const uTimeScale = uniform(1.0);
+        const uMorphFactor = uniform(0.0); // Used to explode or assemble
+        const uMouse = uniform(vec3(0, 0, 0));
+
+        // Interpolation values
+        let currentCamPos = new THREE.Vector3(0, 0, 25);
+        let currentColor = new THREE.Color('#ffffff');
+        let currentSpeed = 1.0;
+        let lastTime = 0;
+        let accumTime = 0;
+
+        init();
+
+        function init() {
+            const container = document.getElementById('webgpu-canvas');
+
+            // 1. Scene & Camera
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x020202, 0.02);
+
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.copy(currentCamPos);
+
+            // 2. Lighting (Standard lights work perfectly with NodeMaterial)
+            const ambient = new THREE.AmbientLight(0x222222);
+            scene.add(ambient);
+
+            const dLight1 = new THREE.DirectionalLight(0xffffff, 2);
+            dLight1.position.set(10, 20, 10);
+            scene.add(dLight1);
+
+            const dLight2 = new THREE.DirectionalLight(0x4444ff, 3);
+            dLight2.position.set(-10, -10, -10);
+            scene.add(dLight2);
+
+            // 3. Geometry & TSL Material
+            // We use a slender, sharp geometry to create a high-tech "monolith" or shard storm look
+            const geometry = new THREE.CylinderGeometry(0, 0.15, 2, 3);
+
+            const material = new MeshStandardNodeMaterial({
+                roughness: 0.1,
+                metalness: 0.8,
+                transparent: true,
+                opacity: 0.9,
+                side: THREE.DoubleSide
+            });
+
+            // TSL Logic: Position Animation based on Instance Index
+            const t = accumTime; // We will handle accumulator in JS and set uniform later, or use built-in 'time'
+            const iTime = time.mul(uTimeScale);
+
+            const idx = float(instanceIndex);
+
+            // Create a structured core (a massive sphere or ring of shards)
+            // Using spherical distribution logic
+            const maxIdx = float(INSTANCE_COUNT);
+            const phi = Math.PI * 2.0;
+
+            // Golden angle distribution for natural spherical arrangement
+            const goldenAngle = float(2.39996323);
+            const yOffset = float(1.0).sub(idx.div(maxIdx.sub(1.0)).mul(2.0)); // -1 to 1
+            const radius = float(1.0).sub(yOffset.mul(yOffset)).pow(0.5); // Math.sqrt(1 - y*y)
+            const theta = goldenAngle.mul(idx);
+
+            const baseScale = float(12.0); // Base radius of the sphere
+
+            const baseX = radius.mul(cos(theta)).mul(baseScale);
+            const baseY = yOffset.mul(baseScale);
+            const baseZ = radius.mul(sin(theta)).mul(baseScale);
+
+            const basePosition = vec3(baseX, baseY, baseZ);
+
+            // Chaos/Explosion vectors
+            // Noise based on position
+            const noise = sin(baseX.mul(2.0).add(iTime))
+                .add(cos(baseZ.mul(2.0).add(iTime.mul(0.8))))
+                .add(sin(baseY.mul(1.5).add(iTime.mul(1.2))));
+
+            const chaosVector = basePosition.normalize().mul(noise.mul(3.0));
+
+            // Orbital rotation around Y
+            const rotSpeed = idx.div(maxIdx).mul(0.5).add(0.2);
+            const angle = iTime.mul(rotSpeed).mul(uTimeScale);
+
+            // Rotate base position around Y axis manually in TSL
+            const rotX = basePosition.x.mul(cos(angle)).add(basePosition.z.mul(sin(angle)));
+            const rotZ = basePosition.z.mul(cos(angle)).sub(basePosition.x.mul(sin(angle)));
+            const rotatedBase = vec3(rotX, basePosition.y, rotZ);
+
+            // Mix base spherical formation with chaos based on the Nav state (uMorphFactor)
+            const finalPos = mix(rotatedBase, rotatedBase.add(chaosVector).mul(1.5), uMorphFactor);
+
+            // Mouse Repulsion logic
+            const distToMouse = finalPos.sub(uMouse).length();
+            const repulsion = uMouse.sub(finalPos).normalize().mul(-1.0).mul(float(15.0).div(distToMouse.add(1.0)));
+
+            // Apply to Vertex
+            material.positionNode = positionLocal.add(finalPos).add(repulsion);
+
+            // Orient shards outwards from center
+            // (A true rotation matrix on vertex is complex in basic TSL without quaternions, 
+            // so we rely on the inherent look of the shards scattering, but we can color them vividly based on normals)
+
+            // Color Logic
+            // Make inner shards glow with uColor, outer shards dark
+            const distFromCenter = finalPos.length();
+            const colorFactor = distFromCenter.div(15.0).clamp(0.0, 1.0);
+
+            const coreColor = uColor;
+            const darkColor = color('#050510');
+
+            // Passing emission to the material based on the dynamic uniform
+            const mixColor = mix(coreColor, darkColor, colorFactor.add(noise.mul(0.1)));
+
+            material.colorNode = mixColor;
+            material.emissiveNode = mixColor.mul(float(1.5).sub(colorFactor.mul(1.5))); // Inner elements glow brightly
+
+            // 4. Instanced Mesh Assembly
+            instancedMesh = new THREE.InstancedMesh(geometry, material, INSTANCE_COUNT);
+
+            // Initial random rotations for the shards so they aren't all uniform pointing up
+            const dummy = new THREE.Object3D();
+            for (let i = 0; i < INSTANCE_COUNT; i++) {
+                dummy.rotation.set(
+                    Math.random() * Math.PI,
+                    Math.random() * Math.PI,
+                    Math.random() * Math.PI
+                );
+                dummy.updateMatrix();
+                instancedMesh.setMatrixAt(i, dummy.matrix);
+            }
+            instancedMesh.instanceMatrix.needsUpdate = true;
+
+            scene.add(instancedMesh);
+
+            // 5. Post Processing setup (WebGPURenderer natively handles extreme AA and precision)
+            renderer = new WebGPURenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setClearColor(0x020202, 1.0);
+
+            // Tone mapping for cinematic highlights
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 1.2;
+
+            container.appendChild(renderer.domElement);
+            window.addEventListener('resize', onWindowResize);
+
+            // Start Loop
+            renderer.setAnimationLoop(animate);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // FPS tracking
+        let frames = 0;
+        let prevTime = performance.now();
+        const fpsEl = document.getElementById('fps-counter');
+
+        function animate() {
+            const timeNow = performance.now();
+            const delta = (timeNow - lastTime) / 1000;
+            lastTime = timeNow;
+
+            // FPS Calculate
+            frames++;
+            if (timeNow >= prevTime + 1000) {
+                fpsEl.textContent = (frames * 1000 / (timeNow - prevTime)).toFixed(1) + ' FPS';
+                prevTime = timeNow;
+                frames = 0;
+            }
+
+            // Sync with UI State
+            const state = window.APP_STATE;
+
+            // 1. Lerp Camera Position
+            const targetCam = new THREE.Vector3(state.targetCamPos.x, state.targetCamPos.y, state.targetCamPos.z);
+
+            // Add subtle parallax from global mouse to target cam
+            targetCam.x += state.mouseTarget.x * 2;
+            targetCam.y += state.mouseTarget.y * 2;
+
+            currentCamPos.lerp(targetCam, 0.03);
+            camera.position.copy(currentCamPos);
+
+            // Always look at center, but slightly offset by mouse
+            const lookTarget = new THREE.Vector3(state.mouseTarget.x * 2, state.mouseTarget.y * 2, 0);
+            camera.lookAt(lookTarget);
+
+            // 2. Lerp Uniforms for TSL Material
+
+            // Color
+            const targetC = new THREE.Color(state.targetColor);
+            currentColor.lerp(targetC, 0.05);
+            uColor.value.copy(currentColor);
+
+            // Speed
+            currentSpeed = THREE.MathUtils.lerp(currentSpeed, state.targetSpeed, 0.05);
+            uTimeScale.value = currentSpeed;
+
+            // Morph Factor (changes based on active index to trigger different shapes/explosions)
+            // Index 0: Base Sphere (Morph 0)
+            // Index 1: Pulse (Morph 0.3)
+            // Index 2: Architecture ring (Morph 0.5)
+            // Index 3: Explosion (Morph 1.0)
+            // Index 4: Quantum Cloud (Morph 0.7)
+            let targetMorph = 0.0;
+            if (state.activeIndex === 1) targetMorph = 0.3 + Math.sin(timeNow * 0.005) * 0.1;
+            if (state.activeIndex === 2) targetMorph = 0.5;
+            if (state.activeIndex === 3) targetMorph = 1.0;
+            if (state.activeIndex === 4) targetMorph = 0.7 + Math.cos(timeNow * 0.008) * 0.2;
+
+            uMorphFactor.value = THREE.MathUtils.lerp(uMorphFactor.value, targetMorph, 0.02);
+
+            // Project mouse to 3D space for repulsion
+            const vector = new THREE.Vector3(state.mouseTarget.x, state.mouseTarget.y, 0.5);
+            vector.unproject(camera);
+            const dir = vector.sub(camera.position).normalize();
+            const distance = - camera.position.z / dir.z; // Intersection with Z=0 plane
+            const posToPlane = camera.position.clone().add(dir.multiplyScalar(distance));
+
+            // Smoothly lerp mouse uniform
+            uMouse.value.lerp(posToPlane, 0.1);
+
+            // Render!
+            renderer.render(scene, camera);
+        }
+    </script>
+</body>
+
+</html>
